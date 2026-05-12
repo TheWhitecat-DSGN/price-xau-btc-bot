@@ -46,6 +46,22 @@ def get_gold_price():
     return None
 
 def get_btc_price():
+    # Try Yahoo Finance first
+    try:
+        r = requests.get(
+            "https://query1.finance.yahoo.com/v8/finance/chart/BTC-USD?range=1d&interval=1m",
+            timeout=10, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        if r.status_code == 200:
+            data = r.json()
+            result = data["chart"]["result"][0]
+            price = result["meta"]["regularMarketPrice"]
+            prev = result["meta"]["chartPreviousClose"]
+            change_pct = ((price - prev) / prev) * 100
+            return {"price": round(price, 2), "change_24h": round(change_pct, 2)}
+    except Exception as e:
+        logger.error(f"BTC Yahoo error: {e}")
+    # Fallback CoinGecko
     try:
         r = requests.get(
             "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd&include_24hr_change=true",
@@ -55,7 +71,7 @@ def get_btc_price():
             btc = r.json()["bitcoin"]
             return {"price": btc["usd"], "change_24h": round(btc.get("usd_24h_change", 0), 2)}
     except Exception as e:
-        logger.error(f"BTC error: {e}")
+        logger.error(f"BTC CoinGecko error: {e}")
     return None
 
 def get_analysis(gold_data, btc_data, atype="all"):
