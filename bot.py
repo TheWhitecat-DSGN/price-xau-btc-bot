@@ -1,6 +1,7 @@
 import os
 import logging
 import requests
+import asyncio
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
@@ -17,7 +18,6 @@ TZ = timezone(timedelta(hours=7))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Keep-alive HTTP server for Render
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -25,15 +25,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"Bot is running!")
     def log_message(self, format, *args):
-        pass  # silence logs
-
-def start_http():
-    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-    server.serve_forever()
-
-# Start HTTP in background thread
-threading.Thread(target=start_http, daemon=True).start()
-logger.info(f"HTTP server on port {PORT}")
+        pass
 
 def get_gold_price():
     try:
@@ -50,7 +42,7 @@ def get_gold_price():
             change_pct = (change / prev) * 100
             return {"price": round(price, 2), "change": round(change, 2), "change_pct": round(change_pct, 2)}
     except Exception as e:
-        logger.error(f"Gold price error: {e}")
+        logger.error(f"Gold error: {e}")
     return None
 
 def get_btc_price():
@@ -63,7 +55,7 @@ def get_btc_price():
             btc = r.json()["bitcoin"]
             return {"price": btc["usd"], "change_24h": round(btc.get("usd_24h_change", 0), 2)}
     except Exception as e:
-        logger.error(f"BTC price error: {e}")
+        logger.error(f"BTC error: {e}")
     return None
 
 def get_analysis(gold_data, btc_data, atype="all"):
@@ -71,11 +63,11 @@ def get_analysis(gold_data, btc_data, atype="all"):
         return None
     try:
         if atype == "gold":
-            prompt = f"วิเคราะห์ราคาทองคำ XAUUSD ตอนนี้ ${gold_data['price']:,.2f} ({gold_data['change_pct']:+.2f}%) ให้สั้นๆ ภาษาไทย: สรุปตลาด, จุดสำคัญ, support/resistance, แนวโน้ม ไม่เกิน 300 ตัวอักษร ใช้ emoji"
+            prompt = f"วิเคราะห์ราคาทองคำ XAUUSD ${gold_data['price']:,.2f} ({gold_data['change_pct']:+.2f}%) สั้นๆ ภาษาไทย: สรุปตลาด จุดสำคัญ support resistance แนวโน้ม ไม่เกิน 300 ตัวอักษร ใช้ emoji"
         elif atype == "btc":
-            prompt = f"วิเคราะห์ราคา Bitcoin ตอนนี้ ${btc_data['price']:,.2f} ({btc_data['change_24h']:+.2f}%) ให้สั้นๆ ภาษาไทย: สรุปตลาด, ปัจจัยสำคัญ, support/resistance, แนวโน้ม ไม่เกิน 300 ตัวอักษร ใช้ emoji"
+            prompt = f"วิเคราะห์ Bitcoin ${btc_data['price']:,.2f} ({btc_data['change_24h']:+.2f}%) สั้นๆ ภาษาไทย: สรุปตลาด ปัจจัยสำคัญ support resistance แนวโน้ม ไม่เกิน 300 ตัวอักษร ใช้ emoji"
         else:
-            prompt = f"วิเคราะห์ตลาดให้สั้นๆ ภาษาไทย: ทอง ${gold_data['price']:,.2f} ({gold_data['change_pct']:+.2f}%), BTC ${btc_data['price']:,.2f} ({btc_data['change_24h']:+.2f}%). สรุปตลาด, จุดสำคัญ, แนวโน้ม ไม่เกิน 300 ตัวอักษร ใช้ emoji"
+            prompt = f"วิเคราะห์ตลาดสั้นๆ ภาษาไทย: ทอง ${gold_data['price']:,.2f} ({gold_data['change_pct']:+.2f}%) BTC ${btc_data['price']:,.2f} ({btc_data['change_24h']:+.2f}%) สรุปตลาด จุดสำคัญ แนวโน้ม ไม่เกิน 300 ตัวอักษร ใช้ emoji"
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
         r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 400}}, timeout=30)
@@ -116,7 +108,7 @@ async def send_scheduled(bot):
         logger.error(f"Schedule error: {e}")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 สวัสดี! Bot ราคาทองคำ + BTC\n\n📌 /all /gold /btc\n⏰ ส่งอัตโนมัติ 09:00 + 19:00")
+    await update.message.reply_text("👋 Bot ราคาทองคำ + BTC\n\n📌 /all /gold /btc\n⏰ 09:00 + 19:00")
 
 async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(build_msg("all"))
@@ -132,19 +124,35 @@ async def post_init(application):
     scheduler.add_job(send_scheduled, "cron", hour=9, minute=0, args=[application.bot])
     scheduler.add_job(send_scheduled, "cron", hour=19, minute=0, args=[application.bot])
     scheduler.start()
-    logger.info("Bot ready! Schedule: 09:00 + 19:00")
+    logger.info("Bot ready! 09:00 + 19:00 Bangkok")
+
+async def run():
+    # Start health check HTTP server
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    logger.info(f"HTTP on port {PORT}")
+
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("all", cmd_all))
+    app.add_handler(CommandHandler("gold", cmd_gold))
+    app.add_handler(CommandHandler("btc", cmd_btc))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    logger.info("Bot polling started!")
+
+    # Keep running
+    while True:
+        await asyncio.sleep(3600)
 
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not set!")
         return
     logger.info("Starting bot...")
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("all", cmd_all))
-    app.add_handler(CommandHandler("gold", cmd_gold))
-    app.add_handler(CommandHandler("btc", cmd_btc))
-    app.run_polling(drop_pending_updates=True)
+    asyncio.run(run())
 
 if __name__ == "__main__":
     main()
