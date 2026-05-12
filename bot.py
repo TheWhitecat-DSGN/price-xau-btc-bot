@@ -1,19 +1,39 @@
 import os
 import logging
 import requests
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timezone, timedelta
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-import asyncio
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 CHAT_ID = os.environ.get("CHAT_ID", "1027083696")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+PORT = int(os.environ.get("PORT", 10000))
 TZ = timezone(timedelta(hours=7))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
+
+# Keep-alive HTTP server for Render
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+    def log_message(self, format, *args):
+        pass  # silence logs
+
+def start_http():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    server.serve_forever()
+
+# Start HTTP in background thread
+threading.Thread(target=start_http, daemon=True).start()
+logger.info(f"HTTP server on port {PORT}")
 
 def get_gold_price():
     try:
@@ -40,57 +60,49 @@ def get_btc_price():
             timeout=10
         )
         if r.status_code == 200:
-            data = r.json()
-            btc = data["bitcoin"]
+            btc = r.json()["bitcoin"]
             return {"price": btc["usd"], "change_24h": round(btc.get("usd_24h_change", 0), 2)}
     except Exception as e:
         logger.error(f"BTC price error: {e}")
     return None
 
-def get_analysis(gold_data, btc_data, analysis_type="all"):
+def get_analysis(gold_data, btc_data, atype="all"):
     if not GEMINI_API_KEY:
         return None
     try:
-        if analysis_type == "gold":
+        if atype == "gold":
             prompt = f"วิเคราะห์ราคาทองคำ XAUUSD ตอนนี้ ${gold_data['price']:,.2f} ({gold_data['change_pct']:+.2f}%) ให้สั้นๆ ภาษาไทย: สรุปตลาด, จุดสำคัญ, support/resistance, แนวโน้ม ไม่เกิน 300 ตัวอักษร ใช้ emoji"
-        elif analysis_type == "btc":
+        elif atype == "btc":
             prompt = f"วิเคราะห์ราคา Bitcoin ตอนนี้ ${btc_data['price']:,.2f} ({btc_data['change_24h']:+.2f}%) ให้สั้นๆ ภาษาไทย: สรุปตลาด, ปัจจัยสำคัญ, support/resistance, แนวโน้ม ไม่เกิน 300 ตัวอักษร ใช้ emoji"
         else:
             prompt = f"วิเคราะห์ตลาดให้สั้นๆ ภาษาไทย: ทอง ${gold_data['price']:,.2f} ({gold_data['change_pct']:+.2f}%), BTC ${btc_data['price']:,.2f} ({btc_data['change_24h']:+.2f}%). สรุปตลาด, จุดสำคัญ, แนวโน้ม ไม่เกิน 300 ตัวอักษร ใช้ emoji"
 
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 400}
-        }
-        r = requests.post(url, json=payload, timeout=30)
+        r = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"maxOutputTokens": 400}}, timeout=30)
         if r.status_code == 200:
             return r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-        else:
-            logger.error(f"Gemini error: {r.status_code}")
     except Exception as e:
         logger.error(f"Analysis error: {e}")
     return None
 
-def build_msg(analysis_type="all"):
+def build_msg(atype="all"):
     now = datetime.now(TZ).strftime("%d/%m/%Y %H:%M")
     gold = get_gold_price()
     btc = get_btc_price()
 
-    msg = f"📊 ราคาตลาดวันนี้\n📅 {now} น.\n"
-    msg += "━━━━━━━━━━━━━━━━━━\n\n"
+    msg = f"📊 ราคาตลาดวันนี้\n📅 {now} น.\n━━━━━━━━━━━━━━━━━━\n\n"
 
-    if gold and analysis_type in ("gold", "all"):
+    if gold and atype in ("gold", "all"):
         e = "🟢" if gold["change"] >= 0 else "🔴"
         msg += f"🥇 ทองคำ (XAUUSD)\n   ${gold['price']:,.2f} / oz\n   {e} {gold['change']:+,.2f} ({gold['change_pct']:+,.2f}%)\n\n"
 
-    if btc and analysis_type in ("btc", "all"):
+    if btc and atype in ("btc", "all"):
         e = "🟢" if btc["change_24h"] >= 0 else "🔴"
         msg += f"🟠 Bitcoin (BTCUSD)\n   ${btc['price']:,.2f}\n   {e} {btc['change_24h']:+.2f}% (24h)\n\n"
 
     msg += "━━━━━━━━━━━━━━━━━━\n"
 
-    analysis = get_analysis(gold, btc, analysis_type)
+    analysis = get_analysis(gold, btc, atype)
     if analysis:
         msg += f"\n🔬 วิเคราะห์\n{analysis}\n\n"
 
@@ -99,17 +111,12 @@ def build_msg(analysis_type="all"):
 
 async def send_scheduled(bot):
     try:
-        msg = build_msg("all")
-        await bot.send_message(chat_id=CHAT_ID, text=msg)
+        await bot.send_message(chat_id=CHAT_ID, text=build_msg("all"))
     except Exception as e:
         logger.error(f"Schedule error: {e}")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 สวัสดี! Bot ราคาทองคำ + BTC\n\n"
-        "📌 /all /gold /btc\n"
-        "⏰ ส่งอัตโนมัติ 09:00 + 19:00"
-    )
+    await update.message.reply_text("👋 สวัสดี! Bot ราคาทองคำ + BTC\n\n📌 /all /gold /btc\n⏰ ส่งอัตโนมัติ 09:00 + 19:00")
 
 async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(build_msg("all"))
@@ -125,7 +132,7 @@ async def post_init(application):
     scheduler.add_job(send_scheduled, "cron", hour=9, minute=0, args=[application.bot])
     scheduler.add_job(send_scheduled, "cron", hour=19, minute=0, args=[application.bot])
     scheduler.start()
-    logger.info("Bot ready! Schedule: 09:00 + 19:00 Bangkok")
+    logger.info("Bot ready! Schedule: 09:00 + 19:00")
 
 def main():
     if not BOT_TOKEN:
